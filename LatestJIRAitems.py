@@ -69,23 +69,34 @@ parser.add_argument(
     type=int,
     help=f'How many days of modified items to include (without this, the default of {default_days_historic} is used)'
 )
+parser.add_argument(
+    '--hide_worklog_entries', '-W',
+    required=False,
+    action='store_const',
+    const=1,
+    default=0,
+    help=f'If set, will NOT show all of the work-logged entries for each given item.'
+)
 args = parser.parse_args()
-
+show_worklog = not args.hide_worklog_entries
 
 def print_item(jira_item: dict):
     """Print `jira_item`"""
     total_time = f"{jira_item['total_time'][0]:02d}:{jira_item['total_time'][1]:02d}:{jira_item['total_time'][2]:02d}"
     print(
-        f"Key: {jira_item['key']} ({jira_item['issue_type']})\nURL: {jira_item['url']}\nStatus: {jira_item['status']}\n"
-        f"Last Updated: {jira_item['last_updated'].strftime('%Y-%m-%d %H:%M:%S %z (%a)')}"
-        f"\nSummary: {jira_item['summary']}\nTotal Time Tracked: {total_time}"
+        f"Key: {jira_item['key']} ({jira_item['issue_type']}) :: URL: {jira_item['url']}\n"
+        f"Summary: {jira_item['summary']}\n"
+        f"Status: {jira_item['status']}\n"
+        f"Last Updated: {jira_item['last_updated'].strftime('%Y-%m-%d %H:%M:%S %z (%a)')}\n"
+        f"Total Time Tracked to this Item: {tuple_to_string(human_readable_from_seconds(jira_item['item_seconds_sum']))}"
     )
-    if len(jira_item['time_entries']) > 0:
+    this_item_time = 0
+    if show_worklog and len(jira_item['time_entries']) > 0:
         for timestamp, timestring in jira_item['time_entries'].items():
             if sum(timestring) > 0:
                 timestamp_string = datetime.datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%S.%f%z').strftime('%Y-%m-%d %H:%M:%S (%a)')
-                print(f"\t{timestamp_string}: Time logged = {timestring[0]:02d}:{timestring[1]:02d}:{timestring[2]:02d}")
-    print()
+                print(f"\t{timestamp_string}: Time logged = {tuple_to_string(timestring)}")
+    print("\n")
 
 
 def human_readable_from_seconds(seconds: int) -> (int, int, int):
@@ -101,6 +112,8 @@ def human_readable_from_seconds(seconds: int) -> (int, int, int):
 
     return total_hours, total_minutes, total_seconds
 
+def tuple_to_string(tuple_in: tuple) -> str:
+    return f"{tuple_in[0]:02d}:{tuple_in[1]:02d}:{tuple_in[2]:02d}"
 
 # Get JIRA data
 credential_file = args.credential_file or default_credential_file
@@ -117,8 +130,37 @@ if not credentials:
     print(f"Tried to read first line from credential file '{credential_file}' which is empty. Cannot continue.")
     exit(2)
 
+# Get 'currentUser' info
+jira_url = f'https://{jira_subdomain}.atlassian.net/rest/api/2/myself'
+jira_headers = {
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+    'Authorization': f'Basic {base64.urlsafe_b64encode(credentials.encode()).decode()}'
+}
+try:
+    req = urllib.request.Request(method='GET', url=jira_url, headers=jira_headers)
+    with urllib.request.urlopen(req) as result:
+        data = json.loads(result.read().decode())
+        status = result.status
+        if status != 200:
+            print(f'Failure to get data from JIRA. Response ({status}):\n{result.read().decode()}')
+            exit(3)
+except Exception as url_error:
+    print(f'Failure to make GET {jira_url} request to JIRA: {url_error}')
+    exit(4)
+
+if not data:
+    print(f'No valid JSON data returned for GET {jira_url}. Weird.\nHere is the response data:\n{result.read().decode()}')
+    exit(5)
+
+my_acct_id = data.get('accountId')
+if not my_acct_id:
+    print(f'No "accountId" returned in the `data` for GET {jira_url}.\nHere is the `data` value:\n{data}')
+    exit(6)
+
+
 # Generate JQL
-jql = 'assignee = currentUser()'
+jql = '(worklogAuthor = currentUser() OR assignee = currentUser())'
 if not args.include_resolved_items:
     jql += ' AND resolution = Unresolved'
 if not args.all_historic:
@@ -163,16 +205,17 @@ try:
         status = result.status
         if status != 200:
             print(f'Failure to get data from JIRA. Response ({status}):\n{result.read().decode()}')
-            exit(3)
+            exit(7)
 except Exception as url_error:
-    print(f'Failure to make request to JIRA: {url_error}')
-    exit(4)
+    print(f'Failure to make request GET {jira_url} to JIRA: {url_error}')
+    exit(8)
 
 if not data:
-    print(f'No valid JSON data returned. Weird.\nHere is the response data:\n{result.read().decode()}')
-    exit(5)
+    print(f'No valid JSON data returned for GET {jira_url}. Weird.\nHere is the response data:\n{result.read().decode()}')
+    exit(9)
 
 # Process JIRA data
+total_time_logged = 0
 items = {}
 for item in data.get('issues', []):
     issue_type = item.get('fields', {}).get('issuetype', {}).get('name', 'Unknown Issue Type')
@@ -188,13 +231,14 @@ for item in data.get('issues', []):
     time_spent_string = human_readable_from_seconds(item.get('fields', {}).get('timespent') or 0)
 
     time_entries = {}
+    item_time_sum = 0
     for entry in item.get('changelog', {}).get('histories', []):
-        if len(entry.get('items')) > 0:
+        if len(entry.get('items')) > 0 and entry.get('author', {}).get('accountId') == my_acct_id:
             change_timestamp = entry.get('created')
             for timespent in [r for r in entry.get('items') if r['field'] == 'timespent']:
-                time_entries[change_timestamp] = human_readable_from_seconds(
-                    int(timespent.get('to') or 0) - int(timespent.get('from') or 0)
-                )
+                row_seconds = int(timespent.get('to') or 0) - int(timespent.get('from') or 0)
+                time_entries[change_timestamp] = human_readable_from_seconds(row_seconds)
+                item_time_sum += row_seconds
 
     items[key] = {
         'key': key,
@@ -205,11 +249,20 @@ for item in data.get('issues', []):
         'last_updated': last_updated,
         'last_updated_epoch': last_updated.timestamp(),
         'total_time': time_spent_string,
-        'time_entries': dict(sorted(time_entries.items()))
+        'time_entries': dict(sorted(time_entries.items())),
+        'item_seconds_sum': item_time_sum
     }
+    total_time_logged += item_time_sum
 
 # All items if so configured
-print(f"\nYOUR {len(items)} ITEMS:\n")
+print(f"\nYOUR {len(items)} ITEMS", end='')
+if not args.all_historic:
+    print(f" FROM THE PAST {args.last_days or default_days_historic} DAYS:\n")
+else:
+    print(f" FROM ALL TIME:\n")
+
 for item in items.values():
     print_item(item)
 print()
+print(f"\nTotal Time across all the items above: {tuple_to_string(human_readable_from_seconds(total_time_logged))}\n")
+
